@@ -1,0 +1,4 @@
+node_modules/
+.env
+svc/settings.json
+npm-debug.log*

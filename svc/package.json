@@ -1,0 +1,15 @@
+{
+  "name": "hbo-reset",
+  "version": "1.0.0",
+  "private": true,
+  "description": "HBO Max Profiles/Screens Creator automation service (delete+recreate, PIN lock, House of the Dragon avatars). Self-contained — sits beside nf-reset, shares nothing, cannot affect Netflix/Prime.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "selftest": "node selftest.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "playwright": "^1.56.0"
+  }
+}
