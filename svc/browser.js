@@ -57,6 +57,13 @@ async function newIsolatedContext() {
   });
   ctx.setDefaultTimeout(settings.load().actionTimeout);
   ctx.setDefaultNavigationTimeout(45000);
+  // light stealth — HBO's auth sniffs automation signals
+  await ctx.addInitScript(() => {
+    try { Object.defineProperty(navigator, 'webdriver', { get: () => false }); } catch (_) {}
+    try { Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] }); } catch (_) {}
+    try { Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] }); } catch (_) {}
+    try { window.chrome = window.chrome || { runtime: {} }; } catch (_) {}
+  });
   return ctx;
 }
 

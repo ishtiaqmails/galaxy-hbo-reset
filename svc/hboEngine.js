@@ -252,29 +252,44 @@ async function login(page, email, password, log) {
     throw new EngineError('HBO_LOGIN_FAILED', 'password step not reached at ' + snap.url);
   }
 
+  // capture auth network responses so we can see the real outcome
+  const authResp = [];
+  const onResp = (resp) => {
+    try {
+      const u = resp.url();
+      if (/\.(js|css|png|svg|jpg|woff2?|ico|gif)(\?|$)/i.test(u)) return;
+      if (/login|auth|token|session|oauth|sign|credential|graphql|idp|account/i.test(u)) {
+        authResp.push({ s: resp.status(), m: resp.request().method(), u: u.replace(/^https?:\/\//, '').slice(0, 90) });
+      }
+    } catch (_) {}
+  };
+  page.on('response', onResp);
+
   // password
   const pwBox = page.locator('input[type="password"]:visible').first();
   await pwBox.click();
   await pwBox.fill('');
   await pwBox.pressSequentially(password, { delay: 20 });
-  // confirm the fields actually hold values before submitting
   const pwLen = (await pwBox.inputValue().catch(() => '')).length;
   log.step('login: password typed', { pwLen, ...(await formDump(page)) });
   const signed = await clickByText(page, /^sign in$/i, { timeout: 8000 });
-  if (!signed) { await pwBox.press('Enter').catch(() => {}); }
+  // also submit via Enter — a web-component button can ignore a synthetic click
+  await pwBox.press('Enter').catch(() => {});
   log.step('login: submitted', { url: page.url(), signed });
 
   // success = we reach the play app (profile picker or home)
-  try {
-    await page.waitForURL(/play\.hbomax\.com/, { timeout: 35000 });
-  } catch (_) {
+  let reached = false;
+  try { await page.waitForURL(/play\.hbomax\.com/, { timeout: 35000 }); reached = true; } catch (_) {}
+  page.off('response', onResp);
+  if (!reached) {
     const snap = await pageSnippet(page);
-    log.step('login: post-submit stuck', snap);
+    const tail = authResp.slice(-12);
+    log.step('login: post-submit stuck', { url: snap.url, title: snap.title, snippet: snap.snippet, authResp: tail });
     const challenge = /captcha|verify|robot|unusual|try again later|too many/i.test(snap.snippet);
-    const bad = /incorrect|do(?:esn'?t| not) match|invalid|wrong/i.test(snap.snippet);
-    if (bad) throw new EngineError('HBO_LOGIN_FAILED', 'HBO rejected the email/password');
+    const bad = /incorrect|do(?:esn'?t| not) match|invalid|wrong|couldn'?t sign/i.test(snap.snippet) || tail.some((r) => r.s === 401 || r.s === 403);
+    if (bad) throw new EngineError('HBO_LOGIN_FAILED', 'credentials/authorization rejected — auth=' + JSON.stringify(tail));
     if (challenge) throw new EngineError('HBO_LOGIN_OTP_REQUIRED', 'challenge page: ' + snap.snippet);
-    throw new EngineError('HBO_LOGIN_FAILED', 'Did not reach the app — stuck at ' + snap.url + ' (' + (snap.title || '') + ') ' + snap.snippet);
+    throw new EngineError('HBO_LOGIN_FAILED', 'stuck at ' + snap.url + ' — auth=' + JSON.stringify(tail));
   }
   await settle(page, 1000);
   log.step('login: signed in', { url: page.url() });
@@ -620,7 +635,7 @@ async function runHboJob(ctx, job, hooks = {}) {
   }
 
   const page = await ctx.newPage();
-  const result = { engineVersion: 'v4-shadow', region: 'pk', dryRun, target, category, primaryName: null, created: [], locked: [], avatarFails: [], passwordChanged: false };
+  const result = { engineVersion: 'v5-netcap', region: 'pk', dryRun, target, category, primaryName: null, created: [], locked: [], avatarFails: [], passwordChanged: false };
 
   try {
     await login(page, job.email, job.password, log);
