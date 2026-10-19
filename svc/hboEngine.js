@@ -142,27 +142,51 @@ async function dismissConsent(page) {
   return ok;
 }
 
+// Full visible page text, PIERCING shadow DOM (HBO's auth + app are web
+// components, so document.innerText only sees the light-DOM footer).
 async function pageSnippet(page) {
   try {
     const url = page.url();
     const title = await page.title().catch(() => '');
-    const txt = await page.evaluate(() => (document.body ? document.body.innerText : '')).catch(() => '');
-    return { url, title, snippet: String(txt).replace(/\s+/g, ' ').trim().slice(0, 280) };
+    const txt = await page.evaluate(() => {
+      function deep(node) {
+        let s = '';
+        if (!node) return s;
+        const kids = node.childNodes || [];
+        for (const n of kids) {
+          if (n.nodeType === 3) { s += ' ' + n.textContent; }
+          else if (n.nodeType === 1) { if (n.shadowRoot) s += deep(n.shadowRoot); s += deep(n); }
+        }
+        return s;
+      }
+      return deep(document.body);
+    }).catch(() => '');
+    return { url, title, snippet: String(txt).replace(/\s+/g, ' ').trim().slice(0, 320) };
   } catch (_) { return { url: page.url(), title: '', snippet: '' }; }
 }
 
-// Compact dump of the form state: which inputs/buttons/headings/alerts are
-// actually present and visible. Small enough to carry in the step log.
+// Form state via Playwright locators (these pierce open shadow DOM, unlike
+// document.querySelectorAll). Shows input types + value lengths + button states.
 async function formDump(page) {
   try {
-    return await page.evaluate(() => {
-      const vis = (el) => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 1 && r.height > 1 && s.visibility !== 'hidden' && s.display !== 'none'; };
-      const inputs = [...document.querySelectorAll('input')].map((i) => ({ type: i.type, ph: i.placeholder || '', id: i.id || '', vis: vis(i), vlen: (i.value || '').length }));
-      const buttons = [...document.querySelectorAll('button,[role=button]')].map((b) => ({ text: (b.textContent || '').trim().slice(0, 24), dis: !!(b.disabled || b.getAttribute('aria-disabled') === 'true'), vis: vis(b) })).filter((b) => b.text).slice(0, 12);
-      const headings = [...document.querySelectorAll('h1,h2,h3')].map((h) => (h.textContent || '').trim()).filter(Boolean).slice(0, 6);
-      const alerts = [...document.querySelectorAll('[role=alert],[class*="error" i]')].map((a) => (a.textContent || '').trim()).filter(Boolean).slice(0, 4);
-      return { inputs, buttons, headings, alerts };
-    });
+    const out = { inputs: [], buttons: [] };
+    const inps = (await page.locator('input').all()).slice(0, 10);
+    for (const i of inps) {
+      const type = await i.getAttribute('type').catch(() => '');
+      const ph = await i.getAttribute('placeholder').catch(() => '');
+      const val = await i.inputValue().catch(() => '');
+      const vis = await i.isVisible().catch(() => false);
+      out.inputs.push({ type: type || '', ph: ph || '', vlen: (val || '').length, vis });
+    }
+    const btns = (await page.getByRole('button').all()).slice(0, 14);
+    for (const b of btns) {
+      const txt = (await b.innerText().catch(() => '')).trim().slice(0, 22);
+      if (!txt) continue;
+      const vis = await b.isVisible().catch(() => false);
+      const dis = await b.isDisabled().catch(() => false);
+      out.buttons.push({ text: txt, vis, dis });
+    }
+    return out;
   } catch (e) { return { dumpErr: e.message }; }
 }
 
@@ -233,7 +257,9 @@ async function login(page, email, password, log) {
   await pwBox.click();
   await pwBox.fill('');
   await pwBox.pressSequentially(password, { delay: 20 });
-  log.step('login: password typed');
+  // confirm the fields actually hold values before submitting
+  const pwLen = (await pwBox.inputValue().catch(() => '')).length;
+  log.step('login: password typed', { pwLen, ...(await formDump(page)) });
   const signed = await clickByText(page, /^sign in$/i, { timeout: 8000 });
   if (!signed) { await pwBox.press('Enter').catch(() => {}); }
   log.step('login: submitted', { url: page.url(), signed });
@@ -268,22 +294,22 @@ async function gotoManage(page) {
   }
 }
 
-// Names of the profile tiles on the manage grid (excludes the "New Profile"/add tile).
+// Names of the profile tiles on the manage grid (excludes the "New Profile"/add
+// tile). Uses getByRole so it pierces shadow DOM (HBO's app is web components).
 async function readGridNames(page) {
-  return await page.evaluate(() => {
-    const out = [];
-    const btns = Array.from(document.querySelectorAll('button,a'));
-    for (const b of btns) {
-      const al = (b.getAttribute('aria-label') || '').trim();
-      const m = al.match(/^Edit\s+(.+?)(?:,|$)/i);
-      if (m) {
-        let name = m[1].replace(/⁩|⁨/g, '').trim();
-        if (name && !/avatar/i.test(name)) out.push(name);
-      }
+  const out = [];
+  const btns = await page.getByRole('button').all();
+  for (const b of btns) {
+    const alRaw = await b.getAttribute('aria-label').catch(() => null);
+    if (!alRaw) continue;
+    const al = alRaw.replace(/⁩|⁨/g, '').trim();
+    const m = al.match(/^Edit\s+(.+?)(?:,|$)/i);
+    if (m) {
+      const name = m[1].trim();
+      if (name && !/avatar/i.test(name) && !out.includes(name)) out.push(name);
     }
-    // de-dupe, keep order
-    return [...new Set(out)];
-  });
+  }
+  return out;
 }
 
 async function countProfileTiles(page) {
@@ -314,21 +340,10 @@ function currentProfileId(page) {
 function escapeRx(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
 // Is the currently-open edit page the primary (no Delete Profile control)?
+// getByText pierces shadow DOM.
 async function editPageIsPrimary(page) {
-  const del = await clickableCount(page, /delete profile/i);
+  const del = await page.getByText(/^\s*delete profile\s*$/i).count().catch(() => 0);
   return del === 0;
-}
-
-async function clickableCount(page, rx) {
-  return await page.evaluate((src) => {
-    const re = new RegExp(src, 'i');
-    let n = 0;
-    for (const el of document.querySelectorAll('button,a,[role="button"]')) {
-      const t = (el.textContent || '').trim();
-      if (re.test(t)) n++;
-    }
-    return n;
-  }, rx.source);
 }
 
 // ---- mutations ------------------------------------------------------------
@@ -605,7 +620,7 @@ async function runHboJob(ctx, job, hooks = {}) {
   }
 
   const page = await ctx.newPage();
-  const result = { engineVersion: 'v3-pwstep', region: 'pk', dryRun, target, category, primaryName: null, created: [], locked: [], avatarFails: [], passwordChanged: false };
+  const result = { engineVersion: 'v4-shadow', region: 'pk', dryRun, target, category, primaryName: null, created: [], locked: [], avatarFails: [], passwordChanged: false };
 
   try {
     await login(page, job.email, job.password, log);
