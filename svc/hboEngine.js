@@ -122,51 +122,108 @@ async function typePin(page, pin) {
 
 // ---- login ----------------------------------------------------------------
 
+// Dismiss a cookie/consent overlay (OneTrust & friends). A fresh datacenter
+// context hits these even though a mapping browser that already accepted them
+// never shows one — the exact blocker that bit the Prime engine.
+async function dismissConsent(page) {
+  const sels = [
+    '#onetrust-accept-btn-handler',
+    'button#truste-consent-button',
+    'button[aria-label*="accept" i]',
+    'button[title*="accept" i]',
+  ];
+  for (const sel of sels) {
+    const loc = page.locator(sel).first();
+    try { if ((await loc.count()) && (await loc.isVisible())) { await loc.click({ timeout: 2000 }); await sleep(300); return true; } } catch (_) {}
+  }
+  // text fallback inside any dialog/banner
+  const ok = await clickByText(page, /^(accept all|accept|agree|got it|i accept|allow all)$/i, { timeout: 1500 });
+  if (ok) await sleep(300);
+  return ok;
+}
+
+async function pageSnippet(page) {
+  try {
+    const url = page.url();
+    const title = await page.title().catch(() => '');
+    const txt = await page.evaluate(() => (document.body ? document.body.innerText : '')).catch(() => '');
+    return { url, title, snippet: String(txt).replace(/\s+/g, ' ').trim().slice(0, 280) };
+  } catch (_) { return { url: page.url(), title: '', snippet: '' }; }
+}
+
 async function login(page, email, password, log) {
-  log.step('login: open sign-in');
-  await page.goto(AUTH_LOGIN, { waitUntil: 'domcontentloaded' }).catch(async () => {
-    await page.goto(HOME, { waitUntil: 'domcontentloaded' });
-    await clickByText(page, /sign\s*in/i, { timeout: 10000 });
-  });
-  await settle(page, 600);
+  // Start from the app home so the sign-in OAuth flow carries a return URL back
+  // to play.hbomax.com (navigating straight to /login leaves no return target).
+  log.step('login: open home');
+  await page.goto(HOME, { waitUntil: 'domcontentloaded' }).catch(() => {});
+  await settle(page, 1200);
+  await dismissConsent(page);
+
+  // click the header Sign In if we're not already on the auth host
+  if (!/auth\.hbomax\.com/.test(page.url())) {
+    await clickByText(page, /sign\s*in/i, { timeout: 12000 });
+    await settle(page, 1400);
+  }
+  await dismissConsent(page);
+
+  // if we still don't see a login field, fall back to the direct login URL
+  if (!(await page.locator('input[type="text"], input[type="email"], input[inputmode="email"]').count())) {
+    await page.goto(AUTH_LOGIN, { waitUntil: 'domcontentloaded' }).catch(() => {});
+    await settle(page, 1000);
+    await dismissConsent(page);
+  }
+  log.step('login: at sign-in', await pageSnippet(page));
 
   // email
   const emailBox = page.locator('input[type="text"], input[type="email"], input[inputmode="email"]').first();
   try { await emailBox.waitFor({ state: 'visible', timeout: 15000 }); }
-  catch (_) { throw new EngineError('HBO_LOGIN_FAILED', 'Sign-in email field not found'); }
+  catch (_) { throw new EngineError('HBO_LOGIN_FAILED', 'Sign-in email field not found (' + page.url() + ')'); }
   await emailBox.fill('');
-  await emailBox.pressSequentially(email, { delay: 20 });
+  await emailBox.pressSequentially(email, { delay: 25 });
   await clickByText(page, /continue/i, { timeout: 8000 });
-  await settle(page, 800);
+  await settle(page, 1000);
+  log.step('login: email submitted', { url: page.url() });
 
   // "Did you mean …?" — keep what was typed: click Continue again if still here
   if (page.url().includes('/login') && !(await page.locator('input[type="password"]').count())) {
     await clickByText(page, /continue/i, { timeout: 5000 });
-    await settle(page, 800);
+    await settle(page, 1000);
   }
 
   // password step (or OTP)
   const pwBox = page.locator('input[type="password"]').first();
-  const hasPw = await pwBox.isVisible().catch(() => false);
+  let hasPw = await pwBox.isVisible().catch(() => false);
   if (!hasPw) {
-    // Could be a one-time-code screen — we do password login only.
-    const otp = await page.getByText(/one[-\s]?time code|enter the code/i).count().catch(() => 0);
-    if (otp) throw new EngineError('HBO_LOGIN_OTP_REQUIRED', 'HBO asked for a one-time code');
-    throw new EngineError('HBO_LOGIN_FAILED', 'Password field did not appear');
+    // give slow renders a moment
+    await sleep(1500);
+    hasPw = await pwBox.isVisible().catch(() => false);
+  }
+  if (!hasPw) {
+    const otp = await page.getByText(/one[-\s]?time code|enter the code|verify it'?s you/i).count().catch(() => 0);
+    const snap = await pageSnippet(page);
+    log.step('login: no password field', snap);
+    if (otp) throw new EngineError('HBO_LOGIN_OTP_REQUIRED', 'HBO asked for a code / verification');
+    throw new EngineError('HBO_LOGIN_FAILED', 'No password field at ' + snap.url + ' — ' + snap.snippet);
   }
   await pwBox.fill('');
-  await pwBox.pressSequentially(password, { delay: 15 });
+  await pwBox.pressSequentially(password, { delay: 20 });
   await clickByText(page, /^sign in$/i, { timeout: 8000 });
+  log.step('login: submitted', { url: page.url() });
 
   // success = we reach the play app (profile picker or home)
   try {
-    await page.waitForURL(/play\.hbomax\.com/, { timeout: 30000 });
+    await page.waitForURL(/play\.hbomax\.com/, { timeout: 35000 });
   } catch (_) {
-    const err = await page.getByText(/incorrect|do(?:esn'?t| not) match|try again|invalid/i).count().catch(() => 0);
-    throw new EngineError('HBO_LOGIN_FAILED', err ? 'HBO rejected the email/password' : 'Did not reach the app after sign-in');
+    const snap = await pageSnippet(page);
+    log.step('login: post-submit stuck', snap);
+    const challenge = /captcha|verify|robot|unusual|try again later|too many/i.test(snap.snippet);
+    const bad = /incorrect|do(?:esn'?t| not) match|invalid|wrong/i.test(snap.snippet);
+    if (bad) throw new EngineError('HBO_LOGIN_FAILED', 'HBO rejected the email/password');
+    if (challenge) throw new EngineError('HBO_LOGIN_OTP_REQUIRED', 'challenge page: ' + snap.snippet);
+    throw new EngineError('HBO_LOGIN_FAILED', 'Did not reach the app — stuck at ' + snap.url + ' (' + (snap.title || '') + ') ' + snap.snippet);
   }
-  await settle(page, 800);
-  log.step('login: signed in');
+  await settle(page, 1000);
+  log.step('login: signed in', { url: page.url() });
 }
 
 // ---- profile reading ------------------------------------------------------
@@ -520,7 +577,7 @@ async function runHboJob(ctx, job, hooks = {}) {
   }
 
   const page = await ctx.newPage();
-  const result = { region: 'pk', dryRun, target, category, primaryName: null, created: [], locked: [], avatarFails: [], passwordChanged: false };
+  const result = { engineVersion: 'v2-login-diag', region: 'pk', dryRun, target, category, primaryName: null, created: [], locked: [], avatarFails: [], passwordChanged: false };
 
   try {
     await login(page, job.email, job.password, log);
