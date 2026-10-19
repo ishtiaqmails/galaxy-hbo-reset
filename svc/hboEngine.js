@@ -151,6 +151,21 @@ async function pageSnippet(page) {
   } catch (_) { return { url: page.url(), title: '', snippet: '' }; }
 }
 
+// Compact dump of the form state: which inputs/buttons/headings/alerts are
+// actually present and visible. Small enough to carry in the step log.
+async function formDump(page) {
+  try {
+    return await page.evaluate(() => {
+      const vis = (el) => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 1 && r.height > 1 && s.visibility !== 'hidden' && s.display !== 'none'; };
+      const inputs = [...document.querySelectorAll('input')].map((i) => ({ type: i.type, ph: i.placeholder || '', id: i.id || '', vis: vis(i), vlen: (i.value || '').length }));
+      const buttons = [...document.querySelectorAll('button,[role=button]')].map((b) => ({ text: (b.textContent || '').trim().slice(0, 24), dis: !!(b.disabled || b.getAttribute('aria-disabled') === 'true'), vis: vis(b) })).filter((b) => b.text).slice(0, 12);
+      const headings = [...document.querySelectorAll('h1,h2,h3')].map((h) => (h.textContent || '').trim()).filter(Boolean).slice(0, 6);
+      const alerts = [...document.querySelectorAll('[role=alert],[class*="error" i]')].map((a) => (a.textContent || '').trim()).filter(Boolean).slice(0, 4);
+      return { inputs, buttons, headings, alerts };
+    });
+  } catch (e) { return { dumpErr: e.message }; }
+}
+
 async function login(page, email, password, log) {
   // Start from the app home so the sign-in OAuth flow carries a return URL back
   // to play.hbomax.com (navigating straight to /login leaves no return target).
@@ -174,41 +189,54 @@ async function login(page, email, password, log) {
   }
   log.step('login: at sign-in', await pageSnippet(page));
 
-  // email
+  // email step
   const emailBox = page.locator('input[type="text"], input[type="email"], input[inputmode="email"]').first();
   try { await emailBox.waitFor({ state: 'visible', timeout: 15000 }); }
-  catch (_) { throw new EngineError('HBO_LOGIN_FAILED', 'Sign-in email field not found (' + page.url() + ')'); }
+  catch (_) { throw new EngineError('HBO_LOGIN_FAILED', 'email field not found at ' + page.url()); }
+  await emailBox.click();
   await emailBox.fill('');
   await emailBox.pressSequentially(email, { delay: 25 });
+  log.step('login: email typed', await formDump(page));
   await clickByText(page, /continue/i, { timeout: 8000 });
-  await settle(page, 1000);
-  log.step('login: email submitted', { url: page.url() });
+  await settle(page, 1500);
 
-  // "Did you mean …?" — keep what was typed: click Continue again if still here
-  if (page.url().includes('/login') && !(await page.locator('input[type="password"]').count())) {
+  // "Did you mean …?" suggestion — keep the typed address by clicking Continue again
+  for (let i = 0; i < 2; i++) {
+    const dym = await page.getByText(/did you mean/i).count().catch(() => 0);
+    if (!dym) break;
+    log.step('login: did-you-mean, keeping typed address');
     await clickByText(page, /continue/i, { timeout: 5000 });
-    await settle(page, 1000);
+    await settle(page, 1500);
   }
 
-  // password step (or OTP)
-  const pwBox = page.locator('input[type="password"]').first();
-  let hasPw = await pwBox.isVisible().catch(() => false);
-  if (!hasPw) {
-    // give slow renders a moment
-    await sleep(1500);
-    hasPw = await pwBox.isVisible().catch(() => false);
+  // Wait for the PASSWORD step — the "Sign In" button only exists there (the
+  // email step has a hidden password input in the DOM, so we key off Sign In).
+  let onPwStep = false;
+  for (let i = 0; i < 16; i++) {
+    const signIn = page.getByRole('button', { name: /^sign in$/i }).first();
+    const sVis = (await signIn.count()) ? await signIn.isVisible().catch(() => false) : false;
+    const pwVis = await page.locator('input[type="password"]:visible').count().catch(() => 0);
+    if (sVis && pwVis) { onPwStep = true; break; }
+    await sleep(1000);
   }
-  if (!hasPw) {
-    const otp = await page.getByText(/one[-\s]?time code|enter the code|verify it'?s you/i).count().catch(() => 0);
+  if (!onPwStep) {
+    const dump = await formDump(page);
     const snap = await pageSnippet(page);
-    log.step('login: no password field', snap);
-    if (otp) throw new EngineError('HBO_LOGIN_OTP_REQUIRED', 'HBO asked for a code / verification');
-    throw new EngineError('HBO_LOGIN_FAILED', 'No password field at ' + snap.url + ' — ' + snap.snippet);
+    log.step('login: password step not reached', { ...snap, ...dump });
+    const otc = await page.getByText(/one[-\s]?time code|get a code|verify it'?s you/i).count().catch(() => 0);
+    if (otc) throw new EngineError('HBO_LOGIN_OTP_REQUIRED', 'one-time-code / verification screen');
+    throw new EngineError('HBO_LOGIN_FAILED', 'password step not reached at ' + snap.url);
   }
+
+  // password
+  const pwBox = page.locator('input[type="password"]:visible').first();
+  await pwBox.click();
   await pwBox.fill('');
   await pwBox.pressSequentially(password, { delay: 20 });
-  await clickByText(page, /^sign in$/i, { timeout: 8000 });
-  log.step('login: submitted', { url: page.url() });
+  log.step('login: password typed');
+  const signed = await clickByText(page, /^sign in$/i, { timeout: 8000 });
+  if (!signed) { await pwBox.press('Enter').catch(() => {}); }
+  log.step('login: submitted', { url: page.url(), signed });
 
   // success = we reach the play app (profile picker or home)
   try {
@@ -577,7 +605,7 @@ async function runHboJob(ctx, job, hooks = {}) {
   }
 
   const page = await ctx.newPage();
-  const result = { engineVersion: 'v2-login-diag', region: 'pk', dryRun, target, category, primaryName: null, created: [], locked: [], avatarFails: [], passwordChanged: false };
+  const result = { engineVersion: 'v3-pwstep', region: 'pk', dryRun, target, category, primaryName: null, created: [], locked: [], avatarFails: [], passwordChanged: false };
 
   try {
     await login(page, job.email, job.password, log);
